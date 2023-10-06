@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import PIL.Image
+from PIL import Image, ImageOps
 import torch
 from packaging import version
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
@@ -927,54 +928,56 @@ class StableDiffusionInpaintPipeline(
 
         # 5. Preprocess mask and image
 
-        init_image = self.image_processor.preprocess(image, height=height, width=width)
-        init_image = init_image.to(dtype=torch.float32)
+        # init_image = self.image_processor.preprocess(image, height=height, width=width)
+        # init_image = init_image.to(dtype=torch.float32)
 
         # 6. Prepare latent variables
         num_channels_latents = self.vae.config.latent_channels
         num_channels_unet = self.unet.config.in_channels
         return_image_latents = num_channels_unet == 4
 
-        latents_outputs = self.prepare_latents(
-            batch_size * num_images_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
-            image=init_image,
-            timestep=latent_timestep,
-            is_strength_max=is_strength_max,
-            return_noise=True,
-            return_image_latents=return_image_latents,
-        )
+        # latents_outputs = self.prepare_latents(
+        #     batch_size * num_images_per_prompt,
+        #     num_channels_latents,
+        #     height,
+        #     width,
+        #     prompt_embeds.dtype,
+        #     device,
+        #     generator,
+        #     latents,
+        #     image=init_image,
+        #     timestep=latent_timestep,
+        #     is_strength_max=is_strength_max,
+        #     return_noise=True,
+        #     return_image_latents=return_image_latents,
+        # )
 
-        if return_image_latents:
-            latents, noise, image_latents = latents_outputs
-        else:
-            latents, noise = latents_outputs
+        # if return_image_latents:
+        #     latents, noise, image_latents = latents_outputs
+        # else:
+        #     latents, noise = latents_outputs
 
-        # 7. Prepare mask latent variables
-        mask_condition = self.mask_processor.preprocess(mask_image, height=height, width=width)
+        # # 7. Prepare mask latent variables
+        # mask_condition = self.mask_processor.preprocess(mask_image, height=height, width=width)
 
-        if masked_image_latents is None:
-            masked_image = init_image * (mask_condition < 0.5)
-        else:
-            masked_image = masked_image_latents
+        # if masked_image_latents is None:
+        #     masked_image = init_image * (mask_condition < 0.5)
+        # else:
+        #     masked_image = masked_image_latents
 
-        mask, masked_image_latents = self.prepare_mask_latents(
-            mask_condition,
-            masked_image,
-            batch_size * num_images_per_prompt,
-            height,
-            width,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            do_classifier_free_guidance,
-        )
+        # mask, masked_image_latents = self.prepare_mask_latents(
+        #     mask_condition,
+        #     masked_image,
+        #     batch_size * num_images_per_prompt,
+        #     height,
+        #     width,
+        #     prompt_embeds.dtype,
+        #     device,
+        #     generator,
+        #     do_classifier_free_guidance,
+        # )
+        
+        latents, noise, image_latents, mask, masked_image_latents, overlay_images, paste_loc = self.process_image_and_mask(init_image, mask_image)
 
         # 8. Check that sizes of mask, masked image and latents match
         if num_channels_unet == 9:
@@ -1076,3 +1079,136 @@ class StableDiffusionInpaintPipeline(
             return (image, has_nsfw_concept)
 
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+
+
+    def process_image_and_mask(self, init_image: Image, image_mask: Image):
+        """Processes the image and mask, and returns the processed image and mask.
+        This processing is pretty much consistent with the webui implementation.
+        """
+        image_mask = image_mask.convert("L")
+
+        if self.inpainting_mask_invert == InpaintingMaskInvert.INPAINT_NOT_MASKED:
+            image_mask = ImageOps.invert(image_mask)
+        if self.inpainting_mask_blur > 0:
+            image_mask = image_mask.filter(ImageFilter.GaussianBlur(self.inpainting_mask_blur))
+
+        if self.inpainting_full_res == InpaintingFullRes.ONLY_MASKED:
+            mask_for_overlay = image_mask
+            mask = image_mask.convert("L")
+            crop_region = get_crop_region(np.array(mask), self.inpaint_full_res_padding)
+            crop_region = expand_crop_region(crop_region, self.width, self.height, mask.width, mask.height)
+            x1, y1, x2, y2 = crop_region
+            mask = mask.crop(crop_region)
+            image_mask = resize_images(ResizeMode.RESIZE_AND_FILL, mask, self.width, self.height)
+            paste_loc = (x1, y1, x2 - x1, y2 - y1)
+        else:
+            image_mask = resize_images(self.resize_mode, image_mask, self.width, self.height)
+            np_mask = np.array(image_mask)
+            np_mask = np.clip((np_mask.astype(np.float32)) * 2, 0, 255).astype(np.uint8)
+            mask_for_overlay = Image.fromarray(np_mask)
+            crop_region = None
+            paste_loc = None
+
+        overlay_images = []
+        latent_mask = image_mask
+        image = flatten(init_image, "#ffffff")
+        if crop_region is None and self.resize_mode != ResizeMode.JUST_RESIZE_LATENT_UPSCALE:
+            image = resize_images(self.resize_mode, image, self.width, self.height)
+        image_masked = Image.new("RGBa", (image.width, image.height))
+        image_masked.paste(image.convert("RGBA").convert("RGBa"), mask=ImageOps.invert(mask_for_overlay.convert("L")))
+        overlay_images = [image_masked.convert("RGBA")]
+        # crop_region is not None if we are doing inpaint full res
+        if crop_region is not None:
+            image = image.crop(crop_region)
+            image = resize_images(ResizeMode.RESIZE_AND_FILL, image, self.width, self.height)
+        if self.inpainting_fill != InpaintingFill.ORIGINAL:
+            image = masking_fill(image, latent_mask)
+
+        image = np.array(image).astype(np.float32)
+        image = np.moveaxis(image, 2, 0)
+        image = np.array([image])
+        image = torch.from_numpy(image).to(dtype=torch.float32) / 127.5 - 1.0
+
+        latents_outputs = self.prepare_latents(
+            batch_size=self.batch_size * self.num_images_per_prompt,
+            num_channels_latents=self.vae.config.latent_channels,
+            height=self.height,
+            width=self.width,
+            dtype=self.prompt_embeds.dtype,
+            device=self.device,
+            generator=self.generator,
+            latents=self.init_latents,
+            image=image,
+            timestep=self.latent_timestep,
+            is_strength_max=self.is_strength_max,
+            return_noise=True,
+            return_image_latents=self.return_image_latents,
+        )
+
+        if self.return_image_latents:
+            latents, noise, image_latents = latents_outputs
+        else:
+            latents, noise = latents_outputs
+            image_latents = None
+
+        if self.resize_mode == ResizeMode.JUST_RESIZE_LATENT_UPSCALE or self.num_channels_unet == 9:
+            latents = torch.nn.functional.interpolate(
+                latents,
+                size=(self.height // self.sd_model.vae_scale_factor, self.width // self.sd_model.vae_scale_factor),
+                mode="bilinear",
+            )
+
+        masked_image = latent_mask.convert("RGB").resize((latents.shape[3], latents.shape[2]))
+        masked_image = np.moveaxis(np.array(masked_image, dtype=np.float32), 2, 0) / 255.0
+        masked_image = masked_image[0]
+        masked_image = np.around(masked_image)
+        masked_image = np.tile(masked_image[None], (4, 1, 1))
+        masked_image[masked_image < 0.5] = 0.0
+        masked_image[masked_image >= 0.5] = 1.0
+        masked_image = torch.asarray(masked_image).to(self.device).type(self.prompt_embeds.dtype)
+
+        if self.inpainting_fill == InpaintingFill.LATENT_NOISE:
+            latents = (
+                latents * (1 - masked_image)
+                + randn_tensor(
+                    latents.shape,
+                    generator=self.generator,
+                    device=self.device,
+                    dtype=self.prompt_embeds.dtype,
+                )
+                * masked_image
+            )
+        if self.inpainting_fill == InpaintingFill.LATENT_NOTHING:
+            latents = latents * masked_image
+
+        # duplicate mask and masked_image_latents for each generation per prompt, using mps friendly method
+        if masked_image.shape[0] < self.batch_size:
+            if not self.batch_size % mask.shape[0] == 0:
+                raise ValueError(
+                    "The passed mask and the required batch size don't match. Masks are supposed to be duplicated to"
+                    f" a total batch size of {self.batch_size}, but {masked_image.shape[0]} masks were passed. Make sure the number"
+                    " of masks that you pass is divisible by the total requested batch size."
+                )
+            masked_image = masked_image.repeat(self.batch_size // masked_image.shape[0], 1, 1, 1)
+
+        masked_image = torch.cat([masked_image] * 2) if self.do_classifier_free_guidance else masked_image
+
+        masked_image_latents = None
+        if self.num_channels_unet == 9:  # default case for runwayml/stable-diffusion-inpainting
+            masked_image_latents = self._encode_vae_image(masked_image, generator=self.generator)
+
+            if masked_image_latents.shape[0] < self.batch_size:
+                if not self.batch_size % masked_image_latents.shape[0] == 0:
+                    raise ValueError(
+                        "The passed images and the required batch size don't match. Images are supposed to be duplicated"
+                        f" to a total batch size of {self.batch_size}, but {masked_image_latents.shape[0]} images were passed."
+                        " Make sure the number of images that you pass is divisible by the total requested batch size."
+                    )
+            masked_image_latents = masked_image_latents.repeat(self.batch_size // masked_image_latents.shape[0], 1, 1, 1)
+
+            masked_image_latents = (
+                torch.cat([masked_image_latents] * 2) if self.do_classifier_free_guidance else masked_image_latents
+            )
+            masked_image_latents = masked_image_latents.to(device=self.device, dtype=self.prompt_embeds.dtype)
+
+        return latents, noise, image_latents, masked_image, masked_image_latents, overlay_images, paste_loc
